@@ -1,7 +1,18 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { defaultSubnet, ipToNumber, numberToIp, parseSubnet, subnetAddresses } from "../lib/subnet.mjs";
 import {
+  addressList,
+  defaultSubnet,
+  ipToNumber,
+  maskToPrefix,
+  numberToIp,
+  parseSubnet,
+  scanConcurrency,
+  scanSeconds,
+  subnetAddresses,
+} from "../lib/subnet.mjs";
+import {
+  answered,
   guessType,
   neighbourAnswered,
   parseNeighbours,
@@ -32,10 +43,34 @@ test("si rifiuta ciò che non è una sottorete", () => {
   }
 });
 
-test("si rifiutano le reti troppo ampie", () => {
-  assert.match(parseSubnet("10.0.0.0/21").error, /troppo ampia/);
-  assert.match(parseSubnet("10.0.0.0/8").error, /troppo ampia/);
-  assert.equal(parseSubnet("10.0.0.0/22").size, 1024);
+test("vanno bene reti private di qualsiasi ampiezza", () => {
+  assert.equal(parseSubnet("10.0.0.0/8").size, 16_777_216);
+  assert.equal(parseSubnet("10.20.30.40/8").cidr, "10.0.0.0/8");
+  assert.equal(parseSubnet("172.16.0.0/12").cidr, "172.16.0.0/12");
+  assert.equal(parseSubnet("172.20.5.0/16").cidr, "172.20.0.0/16");
+  assert.equal(parseSubnet("192.168.0.0/16").size, 65_536);
+  assert.equal(parseSubnet("10.0.0.0/21").cidr, "10.0.0.0/21");
+  assert.equal(parseSubnet("192.168.7.9/20").cidr, "192.168.0.0/20");
+});
+
+test("la maschera si può scrivere per esteso", () => {
+  assert.equal(parseSubnet("192.168.1.0/255.255.255.0").cidr, "192.168.1.0/24");
+  assert.equal(parseSubnet("192.168.1.0 255.255.255.0").cidr, "192.168.1.0/24");
+  assert.equal(parseSubnet("192.168.1.0 / 24").cidr, "192.168.1.0/24");
+  assert.equal(parseSubnet("10.0.0.0/255.0.0.0").cidr, "10.0.0.0/8");
+  assert.equal(parseSubnet("172.16.4.0/255.255.252.0").cidr, "172.16.4.0/22");
+  assert.equal(parseSubnet("10.1.2.3/255.255.255.255").cidr, "10.1.2.3/32");
+  assert.match(parseSubnet("192.168.1.0/255.0.255.0").error, /maschera/);
+  assert.match(parseSubnet("192.168.1.0/255.255.255.256").error, /maschera/);
+  assert.equal(maskToPrefix("255.255.255.128"), 25);
+  assert.equal(maskToPrefix("0.0.0.0"), 0);
+  assert.equal(maskToPrefix("255.255.0.255"), null);
+});
+
+test("una rete che esce dagli indirizzi privati è troppo ampia", () => {
+  for (const input of ["10.0.0.0/7", "172.0.0.0/8", "172.16.0.0/11", "192.168.0.0/15", "0.0.0.0/0", "0.0.0.0/0.0.0.0"]) {
+    assert.match(parseSubnet(input).error, /troppo ampia/, input);
+  }
 });
 
 test("si cercano solo reti private", () => {
@@ -62,6 +97,52 @@ test("rete e broadcast non si provano", () => {
   assert.deepEqual(subnetAddresses(parseSubnet("10.0.0.4/30")), ["10.0.0.5", "10.0.0.6"]);
   assert.deepEqual(subnetAddresses(parseSubnet("10.0.0.4/31")), ["10.0.0.4", "10.0.0.5"]);
   assert.deepEqual(subnetAddresses(parseSubnet("10.0.0.4/32")), ["10.0.0.4"]);
+});
+
+test("gli indirizzi di una rete grande non si costruiscono tutti", () => {
+  const list = addressList(parseSubnet("10.0.0.0/8"));
+  assert.equal(list.length, 16_777_214);
+  assert.equal(list.at(0), "10.0.0.1");
+  assert.equal(list.at(255), "10.0.1.0");
+  assert.equal(list.at(list.length - 1), "10.255.255.254");
+  assert.equal(list.at(list.length), undefined);
+  assert.equal(list.at(-1), undefined);
+});
+
+test("la stima della durata cresce con la rete", () => {
+  assert.equal(scanConcurrency(254), 24);
+  assert.equal(scanConcurrency(65_534), 48);
+  assert.ok(scanSeconds(254) < 15);
+  assert.ok(scanSeconds(1022) < 60);
+  const slash16 = scanSeconds(65_534);
+  assert.ok(slash16 > 20 * 60 && slash16 < 40 * 60, String(slash16));
+  assert.ok(scanSeconds(16_777_214) > 2 * 86_400);
+  // Ciò che resta usa le corsie della rete intera
+  assert.equal(scanSeconds(480, 65_534), 10 * 1.05);
+});
+
+test("si tiene solo chi ha risposto, con il suo MAC", () => {
+  const neighbours = parseNeighbours(
+    [
+      "192.168.1.1 dev eth0 lladdr aa:bb:cc:dd:ee:01 REACHABLE",
+      "192.168.1.3 dev eth0 lladdr aa:bb:cc:dd:ee:03 STALE",
+      "192.168.1.4 dev eth0 lladdr aa:bb:cc:dd:ee:04 PROBE",
+      "192.168.1.5 dev eth0  FAILED",
+    ].join("\n"),
+  );
+  const probed = [
+    { address: "192.168.1.1", rtt: 0.4, ports: [] },
+    { address: "192.168.1.2", rtt: null, ports: [80] },
+    { address: "192.168.1.3", rtt: null, ports: [] },
+    { address: "192.168.1.4", rtt: null, ports: [] },
+    { address: "192.168.1.5", rtt: null, ports: [] },
+    { address: "192.168.1.6", rtt: null, ports: [] },
+  ];
+  assert.deepEqual(answered(probed, neighbours), [
+    { address: "192.168.1.1", rtt: 0.4, ports: [], mac: "aa:bb:cc:dd:ee:01" },
+    { address: "192.168.1.2", rtt: null, ports: [80], mac: null },
+    { address: "192.168.1.3", rtt: null, ports: [], mac: "aa:bb:cc:dd:ee:03" },
+  ]);
 });
 
 test("la sottorete proposta è quella della scheda vera", () => {

@@ -2,16 +2,17 @@ import { execFile } from "node:child_process";
 import { Resolver } from "node:dns/promises";
 import { readFile } from "node:fs/promises";
 import net from "node:net";
+import { ipToNumber, scanConcurrency } from "../lib/subnet.mjs";
 import { parsePing } from "./ping.mjs";
 
 /** Le porte che dicono qualcosa sul dispositivo: accesso remoto, web, condivisioni, stampa, video. */
 export const SCAN_PORTS = [22, 80, 443, 445, 554, 631, 3389, 9100];
 
-const OUI_FILE = "/usr/share/ieee-data/oui.txt";
+export const OUI_FILE = "/usr/share/ieee-data/oui.txt";
 const PROBE_MS = 800;
 const DNS_MS = 1000;
+const DNS_CONCURRENCY = 16;
 const PROGRESS_MS = 2000;
-const SCAN_CONCURRENCY = 24;
 const NAME_MAX = 80;
 
 const NETWORK_VENDORS = /cisco|ubiquiti|mikrotik|aruba|juniper|netgear|tp-link|fortinet|zyxel|d-link/;
@@ -131,40 +132,78 @@ async function readVendors(macs) {
 }
 
 /**
- * Prova gli indirizzi e restituisce quelli che hanno risposto. `onProgress` riceve quanti
+ * Tiene chi ha risposto: al ping, a una porta o almeno alla richiesta ARP della rete locale.
+ * Il MAC si prende subito, perché la voce ARP può sparire prima della fine della ricerca.
+ */
+export function answered(probed, neighbours) {
+  const alive = [];
+  for (const item of probed) {
+    const entry = neighbours.get(item.address);
+    if (item.rtt !== null || item.ports.length > 0 || neighbourAnswered(entry)) {
+      alive.push({ ...item, mac: entry?.mac ?? null });
+    }
+  }
+  return alive;
+}
+
+async function mapLimit(items, limit, fn) {
+  const results = new Array(items.length);
+  let next = 0;
+  async function lane() {
+    while (next < items.length) {
+      const index = next++;
+      results[index] = await fn(items[index]);
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, lane));
+  return results;
+}
+
+const addressOrder = (a, b) => ipToNumber(a.address) - ipToNumber(b.address);
+
+/**
+ * Prova gli indirizzi e restituisce quelli che hanno risposto. `addresses` ha `length` e `at()`,
+ * come un array o come `addressList`, che non li costruisce tutti. `onProgress` riceve quanti
  * ne ha provati e restituisce false per fermare la ricerca: in quel caso il risultato è null.
  */
 export async function scanAddresses(addresses, onProgress) {
-  const probed = [];
+  const alive = [];
+  let pending = [];
+  let checked = 0;
   let next = 0;
   let cancelled = false;
   let reported = Date.now();
 
+  // La tabella ARP del kernel tiene poche voci (1.024 di solito): sulle reti grandi si legge
+  // strada facendo, e in memoria resta solo chi ha risposto, non milioni di indirizzi muti
+  async function sortPending() {
+    const batch = pending;
+    pending = [];
+    alive.push(...answered(batch, await readNeighbours()));
+  }
+
   async function lane() {
     while (next < addresses.length && !cancelled) {
-      probed.push(await probeAddress(addresses[next++]));
+      pending.push(await probeAddress(addresses.at(next++)));
+      checked++;
       if (Date.now() - reported < PROGRESS_MS) continue;
       reported = Date.now();
-      if ((await onProgress(probed.length)) === false) cancelled = true;
+      await sortPending();
+      if ((await onProgress(checked)) === false) cancelled = true;
     }
   }
-  await Promise.all(Array.from({ length: Math.min(SCAN_CONCURRENCY, addresses.length) }, lane));
+  await Promise.all(Array.from({ length: Math.min(scanConcurrency(addresses.length), addresses.length) }, lane));
   if (cancelled) return null;
+  await sortPending();
 
-  const neighbours = await readNeighbours();
-  const alive = probed.filter(
-    (item) => item.rtt !== null || item.ports.length > 0 || neighbourAnswered(neighbours.get(item.address)),
-  );
-  const vendors = await readVendors(alive.flatMap((item) => neighbours.get(item.address)?.mac ?? []));
-
+  const vendors = await readVendors(alive.flatMap((item) => item.mac ?? []));
   const resolver = new Resolver({ timeout: DNS_MS, tries: 1 });
-  const names = await Promise.all(alive.map((item) => reverseName(resolver, item.address)));
+  const names = await mapLimit(alive, DNS_CONCURRENCY, (item) => reverseName(resolver, item.address));
 
   return alive
     .map((item, index) => {
-      const mac = neighbours.get(item.address)?.mac ?? null;
-      const vendor = vendorOf(vendors, mac);
-      return { ...item, name: names[index], mac, vendor, type: guessType(item.ports, vendor) };
+      const vendor = vendorOf(vendors, item.mac);
+      return { ...item, name: names[index], vendor, type: guessType(item.ports, vendor) };
     })
-    .sort((a, b) => a.address.localeCompare(b.address, "en", { numeric: true }));
+    .sort(addressOrder);
 }

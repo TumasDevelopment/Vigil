@@ -201,7 +201,7 @@ Tutto si configura dal sito, con un account amministratore. Sono nomi di voci de
 | Funzione | Dove | Da sapere |
 |---|---|---|
 | Aggiungere dispositivi | **Host**, poi **Nuovo host** o **Importa elenco** | Ogni host ha indirizzo, settore e tipo. I settori nascono quando li scrivi |
-| Trovarli in automatico | **Ricerca rete** | Scrivi la sottorete con la maschera, per esempio `192.168.1.0/24`. Solo reti private, al massimo una /22. Controlla le porte 22, 80, 443, 445, 554, 631, 3389 e 9100: un sistema anti-intrusione può segnalarlo |
+| Trovarli in automatico | **Ricerca rete** | Scrivi la sottorete con la maschera, per esempio `192.168.1.0/24`. Qualsiasi rete privata, dalla /8 alla /32, con il prefisso (`/24`) o con la maschera (`255.255.255.0`): una /16 richiede circa mezz'ora, una /8 alcuni giorni. Controlla le porte 22, 80, 443, 445, 554, 631, 3389 e 9100: un sistema anti-intrusione può segnalarlo |
 | Soglie di latenza e perdita | **Host**, poi **Soglie per tipo** | Oltre soglia il dispositivo diventa Instabile |
 | Controlli su porte, siti e certificati | **Servizi**, poi **Nuovo controllo** | Per un host che non risponde al ping: spegni il ping nell'host e aggiungi un controllo su una porta |
 | Dipendenze | **Host**, campo **Collegato a** | Se cade lo switch, gli host collegati risultano non raggiungibili e arriva un solo avviso |

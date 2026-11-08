@@ -3,9 +3,10 @@
 import Link from "next/link";
 import { useEffect, useState } from "react";
 import { addDiscoveredHostsAction, cancelDiscoveryAction, startDiscoveryAction } from "@/lib/actions";
-import { fmtDateTime, fmtMs } from "@/lib/format";
+import { fmtCount, fmtDateTime, fmtDuration, fmtMs } from "@/lib/format";
 import { REFRESH_SECONDS } from "@/lib/ranges";
 import { DEVICE_TYPES } from "@/lib/scope";
+import { addressList, parseSubnet, scanSeconds } from "@/lib/subnet.mjs";
 import type { DiscoveryItem, DiscoveryScan } from "@/lib/types";
 import { SubmitButton, useFormAction } from "./forms";
 import { useLiveData } from "./useLiveData";
@@ -34,8 +35,18 @@ function reachText(item: DiscoveryItem) {
   return "Visto solo in rete locale: serve un controllo";
 }
 
+/** "254 indirizzi, circa 11 s": chi scrive una /8 deve sapere prima che durerà giorni. */
+function estimateText(input: string) {
+  const subnet = parseSubnet(input);
+  if (subnet.error !== undefined) return null;
+  const count = addressList(subnet).length;
+  return `${fmtCount(count)} ${count === 1 ? "indirizzo" : "indirizzi"}, circa ${fmtDuration(scanSeconds(count))}`;
+}
+
 function SearchForm({ suggestion, busy, onStarted }: { suggestion: string; busy: boolean; onStarted: () => void }) {
   const { state, pending, onSubmit } = useFormAction(startDiscoveryAction);
+  const [value, setValue] = useState(suggestion);
+  const estimate = estimateText(value);
 
   useEffect(() => {
     if (state?.ok) onStarted();
@@ -48,9 +59,10 @@ function SearchForm({ suggestion, busy, onStarted }: { suggestion: string; busy:
         <input
           className="input"
           name="subnet"
-          defaultValue={suggestion}
+          value={value}
+          onChange={(event) => setValue(event.target.value)}
           placeholder="192.168.1.0/24"
-          maxLength={18}
+          maxLength={40}
           required
           spellCheck={false}
           autoComplete="off"
@@ -65,12 +77,21 @@ function SearchForm({ suggestion, busy, onStarted }: { suggestion: string; busy:
         </div>
       )}
       <p className="form__hint">
-        Il server prova ogni indirizzo con un ping e con alcune porte comuni. Solo reti private, al massimo una /22. Se la
-        rete ha un sistema che rileva le scansioni, può segnalarla.
+        {estimate && (
+          <>
+            <b>{estimate}.</b>{" "}
+          </>
+        )}
+        Il server prova ogni indirizzo con un ping e con alcune porte comuni. Va bene qualsiasi rete privata, dalla /8 alla
+        /32, con il prefisso (/24) o con la maschera (255.255.255.0): una /16 richiede circa mezz&apos;ora, una /8 alcuni
+        giorni, e la ricerca si può annullare in ogni momento. Se la rete ha un sistema che rileva le scansioni, può
+        segnalarla.
       </p>
     </form>
   );
 }
+
+const remainingSeconds = (scan: DiscoveryScan) => scanSeconds(scan.total - scan.checked, scan.total);
 
 function ScanProgress({ scan }: { scan: DiscoveryScan }) {
   const percent = scan.total > 0 ? Math.round((scan.checked / scan.total) * 100) : 0;
@@ -80,7 +101,8 @@ function ScanProgress({ scan }: { scan: DiscoveryScan }) {
         <span>
           {scan.status === "queued"
             ? `In attesa del worker per ${scan.subnet}…`
-            : `Ricerca in ${scan.subnet}: ${scan.checked} indirizzi provati su ${scan.total}`}
+            : `Ricerca in ${scan.subnet}: ${fmtCount(scan.checked)} indirizzi provati su ${fmtCount(scan.total)}` +
+              (scan.total > scan.checked ? `, ne resta circa ${fmtDuration(remainingSeconds(scan))}` : "")}
         </span>
         <form action={cancelDiscoveryAction}>
           <input type="hidden" name="id" value={scan.id} />

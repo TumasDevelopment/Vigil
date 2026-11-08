@@ -38,6 +38,7 @@ import type {
   ServiceRow,
   ServicesData,
   ServiceStatus,
+  SystemFacts,
 } from "./types";
 
 // Oltre questo ritardo un dato non è più attendibile: meglio "Nessun dato" che un falso "Online"
@@ -1045,7 +1046,7 @@ export async function listUsers() {
 }
 
 export async function getSystemInfo() {
-  const [pinger, stateResult, sizes, cleanups] = await Promise.all([
+  const [pinger, stateResult, sizes, cleanups, factsResult, database] = await Promise.all([
     getPingerStatus(),
     db().query<{ key: string; value: { at?: string; durationMs?: number; hosts?: number } }>(
       "SELECT key, value FROM system_state WHERE key IN ('pinger', 'last_cleanup')",
@@ -1061,6 +1062,16 @@ export async function getSystemInfo() {
               extract(epoch FROM cutoff)::float8 AS cutoff,
               ping_rows::float8 AS ping_rows, outage_rows::float8 AS outage_rows
        FROM cleanup_log ORDER BY ran_at DESC LIMIT 10`,
+    ),
+    db().query<{ value: SystemFacts; updated_at: number }>(
+      "SELECT value, extract(epoch FROM updated_at)::float8 AS updated_at FROM system_state WHERE key = 'system_facts'",
+    ),
+    db().query<{ version: string; started_at: number; timezone: string; connections: number; max_connections: number }>(
+      `SELECT current_setting('server_version') AS version,
+              extract(epoch FROM pg_postmaster_start_time())::float8 AS started_at,
+              current_setting('TimeZone') AS timezone,
+              (SELECT count(*)::float8 FROM pg_stat_activity WHERE datname = current_database()) AS connections,
+              current_setting('max_connections')::float8 AS max_connections`,
     ),
   ]);
 
@@ -1080,5 +1091,8 @@ export async function getSystemInfo() {
     nextCleanup: lastCleanup === null ? null : lastCleanup + cycleDays * 86_400,
     ...sizes.rows[0],
     cleanups: cleanups.rows,
+    facts: factsResult.rows[0]?.value ?? null,
+    factsAt: factsResult.rows[0]?.updated_at ?? null,
+    database: database.rows[0],
   };
 }

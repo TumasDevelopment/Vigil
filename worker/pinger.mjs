@@ -3,11 +3,12 @@ import { hostDownAlert, hostStillDownAlert, hostUpAlert, insertAlerts, serviceAl
 import { isDue, nextCheckState, reachabilityFromChecks, runCheck } from "./checks.mjs";
 import { findCause, hostHealth } from "./dependencies.mjs";
 import { scanAddresses } from "./discovery.mjs";
-import { parseSubnet, subnetAddresses } from "../lib/subnet.mjs";
+import { addressList, parseSubnet } from "../lib/subnet.mjs";
 import { pingHost } from "./ping.mjs";
 import { nextState } from "./state.mjs";
 import { runRetentionIfDue } from "./retention.mjs";
 import { collectServerHealth, metricRow, serverObservations, trackProblems } from "./server-health.mjs";
+import { collectSystemFacts } from "./system-facts.mjs";
 
 try {
   process.loadEnvFile(".env");
@@ -27,6 +28,8 @@ const CHECK_CONCURRENCY = 16;
 const HOUSEKEEPING_MS = 3_600_000;
 const DISCOVERY_MS = 3000;
 const DISCOVERY_KEEP = 5;
+// Sistema operativo, hardware e versioni cambiano di rado: basta rileggerli ogni 6 ore
+const FACTS_MS = 6 * 3_600_000;
 const ACTIVE_MAINTENANCE = "SELECT DISTINCT host_id FROM maintenance_hosts WHERE starts_at <= now() AND ends_at > now()";
 
 const pool = new pg.Pool({ connectionString: process.env.DATABASE_URL, max: 3 });
@@ -359,7 +362,7 @@ async function runDiscovery() {
   try {
     const subnet = parseSubnet(scan.subnet, { allowLoopback: process.env.DISCOVERY_ALLOW_LOOPBACK === "1" });
     if (subnet.error) throw new Error(subnet.error);
-    const addresses = subnetAddresses(subnet);
+    const addresses = addressList(subnet);
     await pool.query("UPDATE discovery_scans SET total = $2 WHERE id = $1", [scan.id, addresses.length]);
 
     const found = await scanAddresses(addresses, async (checked) => {
@@ -377,6 +380,10 @@ async function runDiscovery() {
     "DELETE FROM discovery_scans WHERE id NOT IN (SELECT id FROM discovery_scans ORDER BY id DESC LIMIT $1)",
     [DISCOVERY_KEEP],
   );
+}
+
+async function saveSystemFacts() {
+  await saveSystemState(pool, "system_facts", await collectSystemFacts());
 }
 
 async function closeInterruptedScans() {
@@ -453,3 +460,4 @@ scheduleNext();
 repeat("Controllo servizi", CHECK_MS, runChecks);
 repeat("Campione del server", SERVER_MS, sampleServer);
 repeat("Ricerca dei dispositivi", DISCOVERY_MS, runDiscovery);
+repeat("Dati di sistema", FACTS_MS, saveSystemFacts);

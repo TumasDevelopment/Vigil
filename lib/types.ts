@@ -293,3 +293,24 @@ export interface LongOfflineFeed {
   hosts: LongOfflineHost[];
   serverTime: number;
 }
+
+/** I dati del server raccolti dal worker (worker/system-facts.mjs), che cambiano di rado. */
+export interface SystemFacts {
+  os: { name: string | null; version: string | null; codename: string | null; kernel: string; arch: string; platform: string };
+  hostname: string;
+  timezone: string | null;
+  bootedAt: number;
+  hardware: { vendor: string | null; product: string | null; virtualization: string | null };
+  cpu: { model: string | null; cores: number };
+  memTotal: number;
+  swapTotal: number;
+  diskTotal: number | null;
+  network: {
+    gateway: { address: string; iface: string } | null;
+    dns: string[];
+    cards: { name: string; mac: string | null; addresses: string[] }[];
+  };
+  software: { vigil: string | null; next: string | null; node: string; ping: string | null; nginx: string | null };
+  ouiUpdatedAt: number | null;
+  workerStartedAt: number;
+}
