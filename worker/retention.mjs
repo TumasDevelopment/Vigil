@@ -9,7 +9,7 @@ const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
  * La data dell'ultima pulizia sta nel database, quindi i riavvii non azzerano il conteggio.
  * Le interruzioni ancora in corso non vengono mai cancellate.
  */
-export async function runRetentionIfDue(pool, { cycleDays, keepDays, now = new Date() }) {
+export async function runRetentionIfDue(pool, { cycleDays, keepDays, historyDays = keepDays, auditDays = 365, now = new Date() }) {
   const { rows } = await pool.query("SELECT value FROM system_state WHERE key = 'last_cleanup'");
 
   if (rows.length === 0) {
@@ -23,6 +23,9 @@ export async function runRetentionIfDue(pool, { cycleDays, keepDays, now = new D
   }
 
   const cutoff = new Date(now.getTime() - keepDays * DAY_MS);
+  // Le interruzioni sono poche righe e servono al report mensile e alla pagina di stato:
+  // si tengono più a lungo dei ping
+  const historyCutoff = new Date(now.getTime() - Math.max(keepDays, historyDays) * DAY_MS);
 
   // A blocchi, così gli inserimenti del ciclo di ping non restano in attesa
   let pingRows = 0;
@@ -40,14 +43,15 @@ export async function runRetentionIfDue(pool, { cycleDays, keepDays, now = new D
 
   const { rowCount: outageRows } = await pool.query(
     "DELETE FROM outages WHERE ended_at IS NOT NULL AND ended_at < $1 AND note = ''",
-    [cutoff],
+    [historyCutoff],
   );
 
   // Una nota spiega la causa di un guasto: è la traccia da tenere, non un dato da smaltire
-  await pool.query("DELETE FROM service_outages WHERE ended_at IS NOT NULL AND ended_at < $1 AND note = ''", [cutoff]);
-  await pool.query("DELETE FROM maintenance_windows WHERE ends_at < $1", [cutoff]);
+  await pool.query("DELETE FROM service_outages WHERE ended_at IS NOT NULL AND ended_at < $1 AND note = ''", [historyCutoff]);
+  await pool.query("DELETE FROM maintenance_windows WHERE ends_at < $1", [historyCutoff]);
   await pool.query("DELETE FROM alerts WHERE ts < $1", [cutoff]);
   await pool.query("DELETE FROM server_metrics WHERE ts < $1", [cutoff]);
+  await pool.query("DELETE FROM audit_log WHERE ts < $1", [new Date(now.getTime() - auditDays * DAY_MS)]);
 
   await pool.query(
     "INSERT INTO cleanup_log (ran_at, cutoff, ping_rows, outage_rows) VALUES ($1, $2, $3, $4)",

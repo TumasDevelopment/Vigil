@@ -1,12 +1,15 @@
 import { AlertDevices } from "@/components/AlertDevices";
 import { PasswordForm } from "@/components/PasswordForm";
+import { TotpSection } from "@/components/TotpSection";
 import { requireUser } from "@/lib/auth";
 import { listAlertDevices } from "@/lib/queries";
+import { getTotpState } from "@/lib/queries-enterprise";
 
 export const metadata = { title: "Il mio account · Vigil" };
 
 export default async function AccountPage() {
   const user = await requireUser();
+  const [totp, devices] = await Promise.all([getTotpState(user), listAlertDevices(user)]);
 
   return (
     <>
@@ -25,7 +28,8 @@ export default async function AccountPage() {
           </div>
           <PasswordForm />
         </section>
-        <AlertDevices devices={await listAlertDevices(user)} />
+        <TotpSection enabled={totp.enabled} recoveryLeft={totp.recoveryLeft} />
+        <AlertDevices devices={devices} />
       </div>
     </>
   );

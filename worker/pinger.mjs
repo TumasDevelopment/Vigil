@@ -9,6 +9,17 @@ import { nextState } from "./state.mjs";
 import { runRetentionIfDue } from "./retention.mjs";
 import { collectServerHealth, metricRow, serverObservations, trackProblems } from "./server-health.mjs";
 import { collectSystemFacts } from "./system-facts.mjs";
+import { backupDir } from "./backup.mjs";
+import {
+  createHeartbeat,
+  quietNow,
+  runAfterQuiet,
+  runBackupIfDue,
+  runDomainChecks,
+  runEscalation,
+  runMonthlyReport,
+  runWarrantyChecks,
+} from "./jobs.mjs";
 
 try {
   process.loadEnvFile(".env");
@@ -22,6 +33,15 @@ const CHECK_MS = Number(process.env.CHECK_INTERVAL_SECONDS ?? 30) * 1000;
 const SERVER_MS = Number(process.env.SERVER_SAMPLE_SECONDS ?? 60) * 1000;
 const CYCLE_DAYS = Number(process.env.RETENTION_CYCLE_DAYS ?? 14);
 const KEEP_DAYS = Number(process.env.RETENTION_KEEP_DAYS ?? 7);
+// Le interruzioni servono al report mensile e alle barre della pagina di stato: restano più a lungo dei ping
+const OUTAGE_KEEP_DAYS = Number(process.env.OUTAGE_KEEP_DAYS ?? 400);
+const AUDIT_DAYS = Number(process.env.AUDIT_RETENTION_DAYS ?? 365);
+const BACKUP = {
+  databaseUrl: process.env.DATABASE_URL,
+  dir: backupDir(process.env.BACKUP_DIR),
+  keep: Math.max(1, Number(process.env.BACKUP_KEEP ?? 14) || 14),
+};
+const heartbeat = createHeartbeat(process.env.HEARTBEAT_URL);
 const CERT_MS = 3_600_000;
 const CONCURRENCY = 32;
 const CHECK_CONCURRENCY = 16;
@@ -77,7 +97,7 @@ async function loadHosts() {
   const { rows: all } = await pool.query(
     `SELECT h.id, h.name, h.address, h.group_name, h.enabled, h.ping_enabled, h.parent_id,
             s.status, s.since, s.fail_streak, s.fail_since,
-            o.id AS outage_id, o.alerted AS outage_alerted, o.cause_host_id AS outage_cause
+            o.id AS outage_id, o.alerted AS outage_alerted, o.cause_host_id AS outage_cause, o.tier AS outage_tier
      FROM hosts h
      LEFT JOIN host_state s ON s.host_id = h.id
      LEFT JOIN outages o ON o.host_id = h.id AND o.ended_at IS NULL`,
@@ -125,6 +145,7 @@ async function runCycle() {
   });
   const dependentsOf = (id) =>
     hosts.filter((host) => nodes.get(host.id).health === "down" && findCause(host.id, nodes) === id).length;
+  const quiet = await quietNow(pool, ts);
 
   await inTransaction(async (client) => {
     if (hosts.length > 0) {
@@ -207,7 +228,11 @@ async function runCycle() {
             host.id,
             closeOutageAt,
           ]);
-          const back = hostUpAlert(host, (closeOutageAt.getTime() - new Date(host.since).getTime()) / 1000);
+          const back = {
+            ...hostUpAlert(host, (closeOutageAt.getTime() - new Date(host.since).getTime()) / 1000),
+            tier: host.outage_tier ?? 1,
+            since: host.since,
+          };
           if (host.outage_alerted !== false) alerts.push(back);
           else if (host.outage_cause !== null) alerts.push({ ...back, causedBy: host.outage_cause });
         } else if (status === "offline" && host.outage_id) {
@@ -215,24 +240,28 @@ async function runCycle() {
           if (overdue) alerts.push(hostStillDownAlert(host, (ts.getTime() - new Date(since).getTime()) / 1000));
           if (overdue || cause !== host.outage_cause) {
             await client.query(
-              "UPDATE outages SET alerted = alerted OR $2, cause_host_id = $3 WHERE host_id = $1 AND ended_at IS NULL",
+              `UPDATE outages SET alerted = alerted OR $2, cause_host_id = $3,
+                      tier_since = CASE WHEN $2 THEN now() ELSE tier_since END
+               WHERE host_id = $1 AND ended_at IS NULL`,
               [host.id, overdue, cause],
             );
           }
         }
       }
-      await insertAlerts(client, alerts);
+      await insertAlerts(client, alerts, { quiet });
     }
 
     await saveSystemState(client, "pinger", { durationMs: Date.now() - startedAt, hosts: hosts.length });
   });
+  heartbeat();
 }
 
 async function runChecks() {
   const now = new Date();
   const { rows } = await pool.query(
     `SELECT c.id, c.host_id, c.name, c.kind, c.port, c.url, c.warn_days, c.status, c.since, c.last_check,
-            c.fail_streak, c.fail_since, c.alerted, h.name AS host_name, h.address
+            c.fail_streak, c.fail_since, c.alerted, h.name AS host_name, h.address,
+            (SELECT so.tier FROM service_outages so WHERE so.check_id = c.id AND so.ended_at IS NULL) AS outage_tier
      FROM service_checks c
      JOIN hosts h ON h.id = c.host_id AND h.enabled`,
   );
@@ -265,6 +294,7 @@ async function runChecks() {
     const explained = (hostId) =>
       inMaintenance.has(hostId) || nodes.get(hostId)?.health === "down" || findCause(hostId, nodes) !== null;
 
+    const quiet = await quietNow(pool, ts);
     const alerts = [];
     for (let index = 0; index < due.length; index++) {
       const check = due[index];
@@ -276,21 +306,23 @@ async function runChecks() {
         OFFLINE_AFTER,
       );
 
+      const ref = { checkId: check.id, tier: check.outage_tier ?? 1 };
       let alerted = check.alerted;
       if (state.status === "failed" && !alerted && !explained(check.host_id)) {
-        alerts.push(serviceAlert(check, "failed", result.detail));
+        alerts.push({ ...serviceAlert(check, "failed", result.detail), ...ref });
         alerted = true;
       } else if (state.event === "recovered") {
-        if (alerted) alerts.push(serviceAlert(check, "recovered", result.detail));
+        if (alerted) alerts.push({ ...serviceAlert(check, "recovered", result.detail), ...ref, since: check.since });
         alerted = false;
       } else if (state.event === "warned") {
-        alerts.push(serviceAlert(check, "warned", result.detail));
+        alerts.push({ ...serviceAlert(check, "warned", result.detail), checkId: check.id });
       }
 
       await client.query(
         `UPDATE service_checks
          SET status = $2, since = $3, last_check = $4, last_ms = $5, detail = $6,
-             fail_streak = $7, fail_since = $8, alerted = $9
+             fail_streak = $7, fail_since = $8, alerted = $9,
+             expires_at = CASE WHEN kind = 'cert' THEN coalesce($10, expires_at) END
          WHERE id = $1`,
         [
           check.id,
@@ -302,6 +334,7 @@ async function runChecks() {
           state.failStreak,
           state.failSince,
           alerted,
+          result.expiresAt ?? null,
         ],
       );
       if (state.openOutageAt) {
@@ -319,7 +352,7 @@ async function runChecks() {
         ]);
       }
     }
-    await insertAlerts(client, alerts);
+    await insertAlerts(client, alerts, { quiet });
   });
 }
 
@@ -396,11 +429,17 @@ async function closeInterruptedScans() {
 }
 
 async function housekeeping() {
-  const outcome = await runRetentionIfDue(pool, { cycleDays: CYCLE_DAYS, keepDays: KEEP_DAYS });
+  const outcome = await runRetentionIfDue(pool, {
+    cycleDays: CYCLE_DAYS,
+    keepDays: KEEP_DAYS,
+    historyDays: OUTAGE_KEEP_DAYS,
+    auditDays: AUDIT_DAYS,
+  });
   if (outcome.ran) {
     console.log(`Pulizia: ${outcome.pingRows} ping e ${outcome.outageRows} interruzioni cancellati`);
   }
   await pool.query("DELETE FROM sessions WHERE expires_at < now()");
+  await pool.query("DELETE FROM login_challenges WHERE expires_at < now()");
 }
 
 let stopping = false;
@@ -461,3 +500,9 @@ repeat("Controllo servizi", CHECK_MS, runChecks);
 repeat("Campione del server", SERVER_MS, sampleServer);
 repeat("Ricerca dei dispositivi", DISCOVERY_MS, runDiscovery);
 repeat("Dati di sistema", FACTS_MS, saveSystemFacts);
+repeat("Escalation", 30_000, () => runEscalation(pool, inTransaction));
+repeat("Fine del silenzio", 60_000, () => runAfterQuiet(pool, inTransaction));
+repeat("Scadenza dei domini", 5 * 60_000, () => runDomainChecks(pool));
+repeat("Scadenza delle garanzie", 3_600_000, () => runWarrantyChecks(pool));
+repeat("Report mensile", 3_600_000, () => runMonthlyReport(pool));
+repeat("Backup", 60_000, () => runBackupIfDue(pool, BACKUP));

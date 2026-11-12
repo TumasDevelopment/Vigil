@@ -95,3 +95,21 @@ export function Modal({
     </dialog>
   );
 }
+
+/** Errore o conferma dell'ultimo invio. */
+export function FormNotices({ state }: { state: FormState }) {
+  return (
+    <>
+      {state?.error && (
+        <div className="notice notice--error" role="alert">
+          {state.error}
+        </div>
+      )}
+      {state?.message && (
+        <div className="notice notice--ok" role="status">
+          {state.message}
+        </div>
+      )}
+    </>
+  );
+}

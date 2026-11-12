@@ -52,16 +52,52 @@ export function serviceAlert(check, event, detail) {
   return null;
 }
 
-/** Il JOIN scarta gli avvisi di un host eliminato mentre il ciclo era in corso. */
-export async function insertAlerts(client, alerts) {
+/** Il guasto non è stato preso in carico: l'avviso sale al livello successivo. */
+export function escalationAlert({ hostId, checkId = null, name, tier, seconds }) {
+  return {
+    hostId,
+    checkId,
+    tier,
+    level: "problem",
+    title: checkId ? `${name} ancora non risponde` : `${name} è ancora offline`,
+    body: `Nessuno l'ha preso in carico da ${durationText(seconds)} · livello ${tier}`,
+  };
+}
+
+/** Alla fine delle ore di silenzio: ciò che è caduto di notte e non è ancora tornato. */
+export function afterQuietAlert({ hostId, checkId = null, name, tier, seconds, place }) {
+  return {
+    hostId,
+    checkId,
+    tier,
+    level: "problem",
+    title: checkId ? `${name} non risponde` : `${name} è offline`,
+    body: [`Durante le ore di silenzio, giù da ${durationText(seconds)}`, place].filter(Boolean).join(" · "),
+  };
+}
+
+/**
+ * Il JOIN scarta gli avvisi di un host eliminato mentre il ciclo era in corso.
+ * Con `quiet` (ore di silenzio) gli avvisi degli host non critici restano nell'elenco ma non vanno ai PC;
+ * quelli del server (host_id null) non sono mai silenziati. Un "è tornato" resta silenzioso solo se
+ * anche il guasto lo era (`since` = inizio del guasto): chi ha ricevuto il problema riceve la soluzione.
+ */
+export async function insertAlerts(client, alerts, { quiet = false } = {}) {
   if (alerts.length === 0) return;
   await client.query(
-    `INSERT INTO alerts (host_id, level, title, body, caused_by)
-     SELECT u.host_id, u.level, u.title, u.body, c.id
-     FROM unnest($1::int[], $2::text[], $3::text[], $4::text[], $5::int[])
-          WITH ORDINALITY AS u(host_id, level, title, body, caused_by, position)
+    `INSERT INTO alerts (host_id, level, title, body, caused_by, tier, check_id, quiet)
+     SELECT u.host_id, u.level, u.title, u.body, c.id, u.tier, s.id,
+            $8::boolean AND u.host_id IS NOT NULL AND NOT coalesce(h.critical, false)
+            AND (u.level <> 'resolved' OR (u.since IS NOT NULL AND NOT EXISTS (
+                  SELECT 1 FROM alerts p
+                  WHERE p.host_id = u.host_id AND p.check_id IS NOT DISTINCT FROM u.check_id
+                    AND p.level = 'problem' AND NOT p.quiet AND p.ts >= u.since)))
+     FROM unnest($1::int[], $2::text[], $3::text[], $4::text[], $5::int[], $6::smallint[], $7::int[],
+                 $9::timestamptz[])
+          WITH ORDINALITY AS u(host_id, level, title, body, caused_by, tier, check_id, since, position)
      LEFT JOIN hosts h ON h.id = u.host_id
      LEFT JOIN hosts c ON c.id = u.caused_by
+     LEFT JOIN service_checks s ON s.id = u.check_id
      WHERE u.host_id IS NULL OR h.id IS NOT NULL
      ORDER BY u.position`,
     [
@@ -70,6 +106,10 @@ export async function insertAlerts(client, alerts) {
       alerts.map((alert) => alert.title),
       alerts.map((alert) => alert.body),
       alerts.map((alert) => alert.causedBy ?? null),
+      alerts.map((alert) => Math.min(3, Math.max(1, alert.tier ?? 1))),
+      alerts.map((alert) => alert.checkId ?? null),
+      quiet,
+      alerts.map((alert) => alert.since ?? null),
     ],
   );
 }

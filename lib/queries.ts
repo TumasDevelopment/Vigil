@@ -249,7 +249,24 @@ function toSummary(row: StateRow, visible: number[] | null): HostSummary {
   };
 }
 
-async function getPingerStatus(): Promise<PingerStatus> {
+/** Lo stato degli host che l'utente vede, per la topologia. */
+export async function getHostSummaries(user: SessionUser): Promise<HostSummary[]> {
+  const visible = await visibleHostIds(user);
+  const { rows } = await db().query<StateRow>(
+    `${HOST_SELECT} WHERE ($1::int[] IS NULL OR h.id = ANY($1::int[])) ORDER BY lower(h.name)`,
+    [visible],
+  );
+  return rows.map((row) => toSummary(row, visible));
+}
+
+/** Solo lo stato, mai nomi interni o motivi: serve alla pagina pubblica. */
+export async function getStatesOf(ids: number[]): Promise<Map<number, HostStatus>> {
+  if (ids.length === 0) return new Map();
+  const { rows } = await db().query<StateRow>(`${HOST_SELECT} WHERE h.id = ANY($1::int[])`, [ids]);
+  return new Map(rows.map((row) => [row.id, deriveHealth(row, []).status]));
+}
+
+export async function getPingerStatus(): Promise<PingerStatus> {
   const { rows } = await db().query<{ at: number }>(
     "SELECT extract(epoch FROM updated_at)::float8 AS at FROM system_state WHERE key = 'pinger'",
   );
@@ -788,9 +805,10 @@ export async function getAlertFeed(user: SessionUser, after: number | null) {
      FROM alerts
      WHERE id > $1 AND ($2::boolean OR host_id IS NOT NULL) AND ($3::int[] IS NULL OR host_id = ANY($3))
        AND (caused_by IS NULL OR ($3::int[] IS NOT NULL AND NOT caused_by = ANY($3)))
+       AND NOT quiet AND tier >= $5
      ORDER BY id DESC
      LIMIT $4`,
-    [after, user.role === "admin", visible, ALERT_PAGE + 1],
+    [after, user.role === "admin", visible, ALERT_PAGE + 1, user.alertTier],
   );
 
   const alerts: Alert[] = rows
@@ -828,8 +846,21 @@ export async function listHosts() {
     latency_warn_ms: number | null;
     loss_warn_pct: number | null;
     parent_id: number | null;
+    critical: boolean;
+    public_label: string | null;
+    manufacturer: string | null;
+    model: string | null;
+    serial: string | null;
+    firmware: string | null;
+    location: string | null;
+    owner: string | null;
+    inventory_note: string | null;
+    purchased_on: string | null;
+    warranty_until: string | null;
   }>(
-    `SELECT id, name, address, group_name, device_type, enabled, ping_enabled, latency_warn_ms, loss_warn_pct, parent_id
+    `SELECT id, name, address, group_name, device_type, enabled, ping_enabled, latency_warn_ms, loss_warn_pct, parent_id,
+            critical, public_label, manufacturer, model, serial, firmware, location, owner, inventory_note,
+            to_char(purchased_on, 'YYYY-MM-DD') AS purchased_on, to_char(warranty_until, 'YYYY-MM-DD') AS warranty_until
      FROM hosts ORDER BY lower(group_name), lower(name)`,
   );
   return rows;
@@ -1038,8 +1069,11 @@ export async function listUsers() {
     restricted: boolean;
     sectors: string[];
     host_ids: number[];
+    alert_tier: number;
+    totp_enabled: boolean;
   }>(
-    `SELECT id, username, role, restricted, sectors, host_ids, extract(epoch FROM last_login_at)::float8 AS last_login
+    `SELECT id, username, role, restricted, sectors, host_ids, alert_tier, totp_enabled,
+            extract(epoch FROM last_login_at)::float8 AS last_login
      FROM users ORDER BY lower(username)`,
   );
   return rows;

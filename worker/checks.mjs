@@ -99,7 +99,11 @@ function checkCert(url, warnDays, now) {
     socket.once("secureConnect", () => {
       const validTo = socket.getPeerCertificate()?.valid_to;
       const ms = performance.now() - started;
-      finish(validTo ? { ms, ...certResult(validTo, now, warnDays) } : { ok: false, ms, detail: "Nessun certificato" });
+      const expires = validTo ? new Date(validTo) : null;
+      const expiresAt = expires && !Number.isNaN(expires.getTime()) ? expires : null;
+      finish(
+        validTo ? { ms, ...certResult(validTo, now, warnDays), expiresAt } : { ok: false, ms, detail: "Nessun certificato" },
+      );
     });
     socket.once("error", (error) => finish({ ok: false, ms: null, detail: errorText(error) }));
     return () => socket.destroy();

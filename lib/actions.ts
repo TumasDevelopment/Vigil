@@ -5,22 +5,43 @@ import { revalidatePath } from "next/cache";
 import { headers } from "next/headers";
 import { redirect } from "next/navigation";
 import type { PoolClient } from "pg";
-import { createSession, destroySession, newDeviceToken, requireAdmin, requireUser } from "./auth";
+import { audit } from "./audit";
+import {
+  clearLoginChallenge,
+  createLoginChallenge,
+  createSession,
+  destroySession,
+  getUser,
+  newDeviceToken,
+  requireAdmin,
+  requireUser,
+  spendChallengeAttempt,
+} from "./auth";
 import { db, transaction } from "./db";
+import { INVENTORY_FIELDS, isForeignKeyViolation, isRowId, isUniqueViolation, parseDay, text } from "./form";
 import { clearFailures, lockedMinutes, recordFailure } from "./login-limit";
 import { hashPassword, verifyPassword } from "./password.mjs";
 import { parsePositions, PLAN_MAX_BYTES, sniffImage } from "./plan.mjs";
 import { parseRange } from "./ranges";
-import { DEVICE_TYPES, isDeviceType, isGroupBy, isPanel, isViewMode, parseDeviceType, type DeviceType } from "./scope";
+import { DEVICE_TYPES, isDeviceType, isGroupBy, isPanel, isViewMode, type DeviceType } from "./scope";
 import { parseSubnet } from "./subnet.mjs";
+import { findRecoveryCode, verifyTotp } from "./totp.mjs";
 import { isValidAddress, isValidCheckUrl, isValidPassword, isValidUsername } from "./validate";
 
-export type FormState = { ok?: boolean; error?: string; message?: string; id?: number; token?: string } | undefined;
+export type FormState =
+  | {
+      ok?: boolean;
+      error?: string;
+      message?: string;
+      id?: number;
+      token?: string;
+      /** Accesso: quale passo mostrare dopo questa risposta. */
+      next?: "totp" | "password";
+      /** Dati di ritorno per il modulo (anteprime, codici da mostrare una volta). */
+      data?: unknown;
+    }
+  | undefined;
 
-const text = (form: FormData, key: string) => String(form.get(key) ?? "").trim();
-const isUniqueViolation = (error: unknown) => (error as { code?: string }).code === "23505";
-const isForeignKeyViolation = (error: unknown) => (error as { code?: string }).code === "23503";
-const isRowId = (value: number) => Number.isInteger(value) && value > 0 && value <= 2_147_483_647;
 
 /** Campo numerico facoltativo. Vuoto: null. Non valido: undefined. */
 function parseLimit(value: string, min: number, max: number) {
@@ -36,35 +57,118 @@ const LATENCY_MAX_MS = 60_000;
 let decoyHash: Promise<string> | undefined;
 const getDecoyHash = () => (decoyHash ??= hashPassword(randomBytes(16).toString("hex")));
 
+const loginAddress = async () => (await headers()).get("x-real-ip") ?? "locale";
+const auditName = (username: string) => username.slice(0, 64);
+
+/** Un tentativo sbagliato: conta per il blocco e, se è quello che blocca, finisce nel registro. */
+async function loginFailed(address: string, username: string, action: string, userId: number | null = null) {
+  recordFailure(address, username);
+  await audit({ id: userId, username: auditName(username) }, action);
+  if (lockedMinutes(address, username) > 0) await audit({ id: userId, username: auditName(username) }, "login.locked");
+}
+
+async function finishLogin(address: string, userId: number, username: string, action = "login.ok"): Promise<never> {
+  clearFailures(address, username);
+  await clearLoginChallenge();
+  await db().query("UPDATE users SET last_login_at = now() WHERE id = $1", [userId]);
+  await createSession(userId);
+  await audit({ id: userId, username }, action);
+  redirect("/");
+}
+
 export async function loginAction(_state: FormState, form: FormData): Promise<FormState> {
   const username = text(form, "username");
   const password = String(form.get("password") ?? "");
   if (!username || !password) return { error: "Inserisci nome utente e password." };
 
-  const address = (await headers()).get("x-real-ip") ?? "locale";
+  const address = await loginAddress();
   const minutes = lockedMinutes(address, username);
   if (minutes > 0) return { error: `Troppi tentativi. Riprova tra ${minutes} min.` };
 
-  const { rows } = await db().query<{ id: number; password_hash: string }>(
-    "SELECT id, password_hash FROM users WHERE lower(username) = lower($1)",
+  const { rows } = await db().query<{ id: number; username: string; password_hash: string; totp_enabled: boolean }>(
+    "SELECT id, username, password_hash, totp_enabled FROM users WHERE lower(username) = lower($1)",
     [username],
   );
   const user = rows[0];
   const valid = await verifyPassword(password.slice(0, 128), user?.password_hash ?? (await getDecoyHash()));
 
   if (!user || !valid) {
-    recordFailure(address, username);
+    await loginFailed(address, username, "login.failed", user?.id ?? null);
     return { error: "Nome utente o password non corretti." };
   }
 
-  clearFailures(address, username);
-  await db().query("UPDATE users SET last_login_at = now() WHERE id = $1", [user.id]);
-  await createSession(user.id);
-  redirect("/");
+  // Con i due fattori la sessione nasce solo dopo il codice
+  if (user.totp_enabled) {
+    await createLoginChallenge(user.id);
+    return { ok: true, next: "totp" };
+  }
+  return finishLogin(address, user.id, user.username);
+}
+
+/** Secondo passo: il codice dell'app oppure uno dei codici di recupero, che vale una volta sola. */
+export async function verifyTotpAction(_state: FormState, form: FormData): Promise<FormState> {
+  const code = text(form, "code");
+  if (!code) return { error: "Inserisci il codice.", next: "totp" };
+
+  const userId = await spendChallengeAttempt();
+  if (userId === null) {
+    await clearLoginChallenge();
+    return { error: "Tempo scaduto o troppi tentativi: inserisci di nuovo la password.", next: "password" };
+  }
+
+  const { rows } = await db().query<{
+    username: string;
+    totp_secret: string | null;
+    totp_last_step: string | null;
+    recovery_codes: Buffer[];
+  }>("SELECT username, totp_secret, totp_last_step, recovery_codes FROM users WHERE id = $1 AND totp_enabled", [
+    userId,
+  ]);
+  const user = rows[0];
+  if (!user?.totp_secret) {
+    await clearLoginChallenge();
+    return { error: "Inserisci di nuovo la password.", next: "password" };
+  }
+
+  const address = await loginAddress();
+  const minutes = lockedMinutes(address, user.username);
+  if (minutes > 0) {
+    await clearLoginChallenge();
+    return { error: `Troppi tentativi. Riprova tra ${minutes} min.`, next: "password" };
+  }
+
+  const step = verifyTotp(user.totp_secret, code, Date.now() / 1000, user.totp_last_step);
+  if (step !== null) {
+    // La condizione impedisce che due richieste simultanee usino lo stesso codice
+    const { rowCount } = await db().query(
+      "UPDATE users SET totp_last_step = $2 WHERE id = $1 AND (totp_last_step IS NULL OR totp_last_step < $2)",
+      [userId, step],
+    );
+    if (rowCount) return finishLogin(address, userId, user.username);
+  }
+
+  const index = findRecoveryCode(user.recovery_codes ?? [], code);
+  if (index >= 0) {
+    const { rowCount } = await db().query(
+      "UPDATE users SET recovery_codes = array_remove(recovery_codes, $2::bytea) WHERE id = $1 AND $2::bytea = ANY(recovery_codes)",
+      [userId, user.recovery_codes[index]],
+    );
+    if (rowCount) return finishLogin(address, userId, user.username, "login.recovery");
+  }
+
+  await loginFailed(address, user.username, "login.2fa_failed", userId);
+  return { error: "Codice non corretto.", next: "totp" };
+}
+
+/** Torna alla password senza aspettare la scadenza del secondo passo. */
+export async function cancelTotpAction() {
+  await clearLoginChallenge();
 }
 
 export async function logoutAction() {
+  const user = await getUser();
   await destroySession();
+  if (user) await audit(user, "logout");
   redirect("/login");
 }
 
@@ -89,6 +193,7 @@ export async function changeOwnPasswordAction(_state: FormState, form: FormData)
     await client.query("DELETE FROM sessions WHERE user_id = $1", [user.id]);
   });
   await createSession(user.id);
+  await audit(user, "password.change");
   return { ok: true, message: "Password aggiornata." };
 }
 
@@ -130,7 +235,7 @@ async function wouldLoop(ids: number[], parent: number) {
 }
 
 export async function saveHostAction(_state: FormState, form: FormData): Promise<FormState> {
-  await requireAdmin();
+  const user = await requireAdmin();
   const id = Number(form.get("id")) || null;
   const name = text(form, "name");
   const address = text(form, "address");
@@ -150,14 +255,32 @@ export async function saveHostAction(_state: FormState, form: FormData): Promise
   if (parent !== null && !isRowId(parent)) return { error: "Scegli il dispositivo a cui è collegato." };
   if (parent !== null && id !== null && (await wouldLoop([id], parent))) return { error: LOOP_ERROR };
 
-  const fields = [name, address, sector, type, ping, latencyWarn, lossWarn, parent];
+  const critical = form.get("critical") === "on";
+  const publicLabel = text(form, "publicLabel") || null;
+  if (publicLabel && publicLabel.length > 80) return { error: "Il nome pubblico può avere al massimo 80 caratteri." };
+  const inventory: (string | null)[] = [];
+  for (const field of INVENTORY_FIELDS) {
+    const value = text(form, field.key);
+    if (value.length > field.max) return { error: `${field.label} può avere al massimo ${field.max} caratteri.` };
+    inventory.push(value || null);
+  }
+  const purchasedOn = parseDay(text(form, "purchasedOn"));
+  const warrantyUntil = parseDay(text(form, "warrantyUntil"));
+  if (purchasedOn === undefined || warrantyUntil === undefined) return { error: "Date non valide: usa il calendario." };
+
+  const fields = [
+    ...[name, address, sector, type, ping, latencyWarn, lossWarn, parent],
+    ...[critical, publicLabel, ...inventory, purchasedOn, warrantyUntil],
+  ];
 
   try {
     await transaction(async (client) => {
       if (id === null) {
         await client.query(
-          `INSERT INTO hosts (name, address, group_name, device_type, ping_enabled, latency_warn_ms, loss_warn_pct, parent_id)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+          `INSERT INTO hosts (name, address, group_name, device_type, ping_enabled, latency_warn_ms, loss_warn_pct, parent_id,
+                              critical, public_label, manufacturer, model, serial, firmware, location, owner, inventory_note,
+                              purchased_on, warranty_until)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)`,
           fields,
         );
         return;
@@ -168,7 +291,12 @@ export async function saveHostAction(_state: FormState, form: FormData): Promise
       );
       await client.query(
         `UPDATE hosts SET name = $2, address = $3, group_name = $4, device_type = $5,
-           ping_enabled = $6, latency_warn_ms = $7, loss_warn_pct = $8, parent_id = $9
+           ping_enabled = $6, latency_warn_ms = $7, loss_warn_pct = $8, parent_id = $9,
+           critical = $10, public_label = $11, manufacturer = $12, model = $13, serial = $14, firmware = $15,
+           location = $16, owner = $17, inventory_note = $18, purchased_on = $19,
+           -- Con una garanzia nuova l'avviso di scadenza torna a valere
+           warranty_alerted_for = CASE WHEN warranty_until IS DISTINCT FROM $20::date THEN NULL ELSE warranty_alerted_for END,
+           warranty_until = $20
          WHERE id = $1`,
         [id, ...fields],
       );
@@ -182,53 +310,14 @@ export async function saveHostAction(_state: FormState, form: FormData): Promise
     throw error;
   }
 
+  await audit(user, id === null ? "host.create" : "host.update", `${name} (${address})`);
   revalidateHosts();
+  revalidatePath("/inventario");
   return { ok: true };
 }
 
-export async function importHostsAction(_state: FormState, form: FormData): Promise<FormState> {
-  await requireAdmin();
-  const lines = String(form.get("lines") ?? "")
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter(Boolean);
-
-  if (lines.length === 0) return { error: "Incolla almeno una riga." };
-  if (lines.length > 500) return { error: "Massimo 500 righe per volta." };
-
-  const parsed: { name: string; address: string; sector: string; type: DeviceType }[] = [];
-  for (const [index, line] of lines.entries()) {
-    const [name, address, sector = "", typeText = ""] = line.split(/[;,\t]/).map((part) => part.trim());
-    const type = typeText ? parseDeviceType(typeText) : "altro";
-    if (!name || name.length > 80 || !address || !isValidAddress(address) || sector.length > 40 || !type) {
-      return { error: `Riga ${index + 1} non valida: "${line.slice(0, 60)}". Nessun host è stato aggiunto.` };
-    }
-    parsed.push({ name, address, sector, type });
-  }
-
-  const added = await transaction(async (client) => {
-    let count = 0;
-    for (const host of parsed) {
-      const { rowCount } = await client.query(
-        `INSERT INTO hosts (name, address, group_name, device_type) VALUES ($1, $2, $3, $4)
-         ON CONFLICT (address) DO NOTHING`,
-        [host.name, host.address, host.sector, host.type],
-      );
-      count += rowCount ?? 0;
-    }
-    return count;
-  });
-
-  revalidateHosts();
-  const skipped = parsed.length - added;
-  return {
-    ok: true,
-    message: `${added} host aggiunti${skipped ? `, ${skipped} già presenti` : ""}.`,
-  };
-}
-
 export async function bulkUpdateHostsAction(_state: FormState, form: FormData): Promise<FormState> {
-  await requireAdmin();
+  const user = await requireAdmin();
   const ids = form.getAll("id").map(Number).filter(isRowId);
   const sector = text(form, "sector");
   const type = text(form, "type");
@@ -257,25 +346,42 @@ export async function bulkUpdateHostsAction(_state: FormState, form: FormData): 
     throw error;
   }
 
+  await audit(user, "host.bulk", `${updated ?? 0} host`, {
+    sector: sector || undefined,
+    type: type || undefined,
+    parent: link ? parent : undefined,
+  });
   revalidateHosts();
   return { ok: true, message: updated === 1 ? "1 host aggiornato." : `${updated} host aggiornati.` };
 }
 
 export async function toggleHostAction(form: FormData) {
-  await requireAdmin();
+  const user = await requireAdmin();
   const id = Number(form.get("id"));
   const enabled = form.get("enabled") === "true";
+  if (!isRowId(id)) return;
 
-  await transaction(async (client) => {
-    await client.query("UPDATE hosts SET enabled = $2 WHERE id = $1", [id, enabled]);
-    if (!enabled) await resetMonitoring(client, id);
+  const name = await transaction(async (client) => {
+    const { rows } = await client.query<{ name: string }>("UPDATE hosts SET enabled = $2 WHERE id = $1 RETURNING name", [
+      id,
+      enabled,
+    ]);
+    if (rows[0] && !enabled) await resetMonitoring(client, id);
+    return rows[0]?.name;
   });
+  if (name) await audit(user, enabled ? "host.enable" : "host.disable", name);
   revalidateHosts();
 }
 
 export async function deleteHostAction(form: FormData) {
-  await requireAdmin();
-  await db().query("DELETE FROM hosts WHERE id = $1", [Number(form.get("id"))]);
+  const user = await requireAdmin();
+  const id = Number(form.get("id"));
+  if (!isRowId(id)) return;
+  const { rows } = await db().query<{ name: string; address: string }>(
+    "DELETE FROM hosts WHERE id = $1 RETURNING name, address",
+    [id],
+  );
+  if (rows[0]) await audit(user, "host.delete", `${rows[0].name} (${rows[0].address})`);
   revalidateHosts();
 }
 
@@ -328,24 +434,37 @@ export async function saveMaintenanceAction(_state: FormState, form: FormData): 
     throw error;
   }
 
+  await audit(user, "maintenance.save", sector !== null ? `Settore ${sector || "senza nome"}` : `Host ${hostId}`, {
+    starts: starts.toISOString(),
+    ends: ends.toISOString(),
+    reason: reason || undefined,
+  });
   revalidatePath("/admin/manutenzioni");
   return { ok: true };
 }
 
 export async function endMaintenanceAction(form: FormData) {
-  await requireAdmin();
-  await db().query("UPDATE maintenance_windows SET ends_at = now() WHERE id = $1 AND starts_at < now() AND ends_at > now()", [
-    Number(form.get("id")),
-  ]);
+  const user = await requireAdmin();
+  const id = Number(form.get("id"));
+  if (!isRowId(id)) return;
+  const { rowCount } = await db().query(
+    "UPDATE maintenance_windows SET ends_at = now() WHERE id = $1 AND starts_at < now() AND ends_at > now()",
+    [id],
+  );
+  if (rowCount) await audit(user, "maintenance.end", `Manutenzione ${id}`);
   revalidatePath("/admin/manutenzioni");
 }
 
 /** Una finestra in corso si termina, non si cancella: la sua parte già trascorsa resta valida. */
 export async function deleteMaintenanceAction(form: FormData) {
-  await requireAdmin();
-  await db().query("DELETE FROM maintenance_windows WHERE id = $1 AND NOT (starts_at <= now() AND ends_at > now())", [
-    Number(form.get("id")),
-  ]);
+  const user = await requireAdmin();
+  const id = Number(form.get("id"));
+  if (!isRowId(id)) return;
+  const { rowCount } = await db().query(
+    "DELETE FROM maintenance_windows WHERE id = $1 AND NOT (starts_at <= now() AND ends_at > now())",
+    [id],
+  );
+  if (rowCount) await audit(user, "maintenance.delete", `Manutenzione ${id}`);
   revalidatePath("/admin/manutenzioni");
 }
 
@@ -363,22 +482,30 @@ export async function saveOutageNoteAction(_state: FormState, form: FormData): P
   if (!isRowId(id)) return { error: "Interruzione non trovata." };
   if (note.length > NOTE_MAX) return { error: `La nota può avere al massimo ${NOTE_MAX} caratteri.` };
 
-  // Scrivere una nota su un guasto di un altro non lo toglie a chi lo sta seguendo
-  const { rowCount } = await db().query(
+  // Scrivere una nota su un guasto di un altro non lo toglie a chi lo sta seguendo.
+  // La presa in carico ferma anche l'escalation: il worker sale di livello solo se ack_by è vuoto.
+  const { rows } = await db().query<{ ack_by: string }>(
     `UPDATE ${table} SET note = $2,
        ack_at = CASE WHEN ack_by IS NULL OR $3::boolean THEN now() ELSE ack_at END,
        ack_by = CASE WHEN ack_by IS NULL OR $3::boolean THEN $4 ELSE ack_by END
-     WHERE id = $1`,
+     WHERE id = $1
+     RETURNING ack_by`,
     [id, note, takeOver, user.username],
   );
-  if (!rowCount) return { error: "Interruzione non trovata." };
+  if (!rows[0]) return { error: "Interruzione non trovata." };
+  await audit(
+    user,
+    rows[0].ack_by === user.username ? "outage.ack" : "outage.note",
+    `${table === "outages" ? "Host" : "Servizio"}, interruzione ${id}`,
+    note ? { note } : null,
+  );
   return { ok: true };
 }
 
 // Planimetrie
 
 export async function saveFloorPlanAction(_state: FormState, form: FormData): Promise<FormState> {
-  await requireAdmin();
+  const user = await requireAdmin();
   const id = Number(form.get("id")) || null;
   const name = text(form, "name");
   const file = form.get("image");
@@ -399,6 +526,7 @@ export async function saveFloorPlanAction(_state: FormState, form: FormData): Pr
         "INSERT INTO floor_plans (name, image, mime) VALUES ($1, $2, $3) RETURNING id",
         [name, image, mime],
       );
+      await audit(user, "plan.save", name);
       revalidatePath("/planimetrie");
       return { ok: true, id: rows[0].id };
     }
@@ -415,20 +543,25 @@ export async function saveFloorPlanAction(_state: FormState, form: FormData): Pr
     throw error;
   }
 
+  await audit(user, "plan.save", name);
   revalidatePath("/planimetrie");
   return { ok: true, id };
 }
 
 export async function deleteFloorPlanAction(form: FormData) {
-  await requireAdmin();
-  await db().query("DELETE FROM floor_plans WHERE id = $1", [Number(form.get("id"))]);
+  const user = await requireAdmin();
+  const id = Number(form.get("id"));
+  const { rows } = isRowId(id)
+    ? await db().query<{ name: string }>("DELETE FROM floor_plans WHERE id = $1 RETURNING name", [id])
+    : { rows: [] };
+  if (rows[0]) await audit(user, "plan.delete", rows[0].name);
   revalidatePath("/planimetrie");
   redirect("/planimetrie");
 }
 
 /** Sostituisce tutte le posizioni. Il JOIN scarta gli host eliminati mentre si modificava. */
 export async function savePlanPositionsAction(_state: FormState, form: FormData): Promise<FormState> {
-  await requireAdmin();
+  const user = await requireAdmin();
   const id = Number(form.get("id"));
   const positions = parsePositions(String(form.get("positions") ?? ""));
 
@@ -451,6 +584,7 @@ export async function savePlanPositionsAction(_state: FormState, form: FormData)
     throw error;
   }
 
+  await audit(user, "plan.positions", `Planimetria ${id}`, { hosts: positions.length });
   revalidatePath("/planimetrie");
   return { ok: true };
 }
@@ -466,6 +600,7 @@ export async function startDiscoveryAction(_state: FormState, form: FormData): P
     if (isUniqueViolation(error)) return { error: "C'è già una ricerca in corso: aspetta che finisca o annullala." };
     throw error;
   }
+  await audit(user, "discovery.start", subnet.cidr);
   return { ok: true };
 }
 
@@ -473,11 +608,13 @@ export async function cancelDiscoveryAction(form: FormData) {
   const user = await requireAdmin();
   const id = Number(form.get("id"));
   if (!isRowId(id)) return;
-  await db().query(
+  const { rows } = await db().query<{ subnet: string }>(
     `UPDATE discovery_scans SET status = 'failed', error = $2, finished_at = now()
-     WHERE id = $1 AND status IN ('queued', 'running')`,
+     WHERE id = $1 AND status IN ('queued', 'running')
+     RETURNING subnet::text`,
     [id, `Annullata da ${user.username}.`],
   );
+  if (rows[0]) await audit(user, "discovery.cancel", rows[0].subnet);
 }
 
 /**
@@ -485,7 +622,7 @@ export async function cancelDiscoveryAction(form: FormData) {
  * Un dispositivo che non risponde al ping risulterebbe subito offline: si tiene d'occhio una sua porta.
  */
 export async function addDiscoveredHostsAction(_state: FormState, form: FormData): Promise<FormState> {
-  await requireAdmin();
+  const user = await requireAdmin();
   const scanId = Number(form.get("scan"));
   const sector = text(form, "sector");
   const chosen = [...new Set(form.getAll("address").map(String))];
@@ -532,6 +669,7 @@ export async function addDiscoveredHostsAction(_state: FormState, form: FormData
     return count;
   });
 
+  if (added > 0) await audit(user, "discovery.add", `${added} host`);
   revalidateHosts();
   const skipped = entries.length - added;
   const summary = added === 1 ? "Aggiunto 1 host." : `Aggiunti ${added} host.`;
@@ -539,7 +677,7 @@ export async function addDiscoveredHostsAction(_state: FormState, form: FormData
 }
 
 export async function saveTypeThresholdsAction(_state: FormState, form: FormData): Promise<FormState> {
-  await requireAdmin();
+  const user = await requireAdmin();
 
   const rows: { type: DeviceType; latency: number | null; loss: number | null }[] = [];
   for (const { key, label } of DEVICE_TYPES) {
@@ -558,6 +696,7 @@ export async function saveTypeThresholdsAction(_state: FormState, form: FormData
     [rows.map((row) => row.type), rows.map((row) => row.latency), rows.map((row) => row.loss)],
   );
 
+  await audit(user, "types.thresholds");
   revalidatePath("/admin/host");
   return { ok: true };
 }
@@ -565,7 +704,7 @@ export async function saveTypeThresholdsAction(_state: FormState, form: FormData
 // Controlli sui servizi
 
 export async function saveServiceAction(_state: FormState, form: FormData): Promise<FormState> {
-  await requireAdmin();
+  const user = await requireAdmin();
   const id = Number(form.get("id")) || null;
   const hostId = Number(form.get("hostId"));
   const name = text(form, "name");
@@ -625,13 +764,18 @@ export async function saveServiceAction(_state: FormState, form: FormData): Prom
     throw error;
   }
 
+  await audit(user, "service.save", name, { kind, port: port ?? undefined, url: url ?? undefined });
   revalidatePath("/servizi");
   return { ok: true };
 }
 
 export async function deleteServiceAction(form: FormData) {
-  await requireAdmin();
-  await db().query("DELETE FROM service_checks WHERE id = $1", [Number(form.get("id"))]);
+  const user = await requireAdmin();
+  const id = Number(form.get("id"));
+  const { rows } = isRowId(id)
+    ? await db().query<{ name: string }>("DELETE FROM service_checks WHERE id = $1 RETURNING name", [id])
+    : { rows: [] };
+  if (rows[0]) await audit(user, "service.delete", rows[0].name);
   revalidatePath("/servizi");
 }
 
@@ -644,13 +788,21 @@ export async function createAlertDeviceAction(_state: FormState, form: FormData)
 
   const { token, hash } = newDeviceToken();
   await db().query("INSERT INTO alert_devices (user_id, name, token_hash) VALUES ($1, $2, $3)", [user.id, name, hash]);
+  await audit(user, "device.create", name);
   revalidatePath("/account");
   return { ok: true, token };
 }
 
 export async function deleteAlertDeviceAction(form: FormData) {
   const user = await requireUser();
-  await db().query("DELETE FROM alert_devices WHERE id = $1 AND user_id = $2", [Number(form.get("id")), user.id]);
+  const id = Number(form.get("id"));
+  const { rows } = isRowId(id)
+    ? await db().query<{ name: string }>("DELETE FROM alert_devices WHERE id = $1 AND user_id = $2 RETURNING name", [
+        id,
+        user.id,
+      ])
+    : { rows: [] };
+  if (rows[0]) await audit(user, "device.delete", rows[0].name);
   revalidatePath("/account");
 }
 
@@ -692,6 +844,7 @@ export async function saveProfileAction(_state: FormState, form: FormData): Prom
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id`,
         [name, owner, ...values],
       );
+      await audit(user, "profile.save", name);
       revalidateProfiles();
       return { ok: true, id: rows[0].id };
     }
@@ -709,17 +862,18 @@ export async function saveProfileAction(_state: FormState, form: FormData): Prom
     throw error;
   }
 
+  await audit(user, "profile.save", name);
   revalidateProfiles();
   return { ok: true, id };
 }
 
 export async function deleteProfileAction(form: FormData) {
   const user = await requireUser();
-  await db().query(`DELETE FROM profiles WHERE id = $1 AND ${CAN_EDIT_PROFILE}`, [
-    Number(form.get("id")),
-    user.id,
-    user.role === "admin",
-  ]);
+  const { rows } = await db().query<{ name: string }>(
+    `DELETE FROM profiles WHERE id = $1 AND ${CAN_EDIT_PROFILE} RETURNING name`,
+    [Number(form.get("id")) || 0, user.id, user.role === "admin"],
+  );
+  if (rows[0]) await audit(user, "profile.delete", rows[0].name);
   revalidateProfiles();
 }
 
@@ -735,8 +889,10 @@ export async function saveUserAction(_state: FormState, form: FormData): Promise
   const restricted = role === "viewer" && form.get("access") === "limited";
   const sectors = restricted ? [...new Set(form.getAll("sector").map((value) => String(value).trim()))] : [];
   const hostIds = restricted ? [...new Set(form.getAll("host").map(Number))].filter(isRowId) : [];
+  const alertTier = Number(form.get("alertTier") ?? 1);
 
   if (role !== "admin" && role !== "viewer") return { error: "Ruolo non valido." };
+  if (![1, 2, 3].includes(alertTier)) return { error: "Livello degli avvisi non valido." };
   if (id === null || password) {
     if (!isValidPassword(password)) return { error: "La password deve avere da 8 a 128 caratteri." };
   }
@@ -755,9 +911,9 @@ export async function saveUserAction(_state: FormState, form: FormData): Promise
     const failure = await transaction(async (client) => {
       if (id === null) {
         await client.query(
-          `INSERT INTO users (username, password_hash, role, restricted, sectors, host_ids)
-           VALUES ($1, $2, $3, $4, $5, $6)`,
-          [username, passwordHash, role, restricted, sectors, hostIds],
+          `INSERT INTO users (username, password_hash, role, restricted, sectors, host_ids, alert_tier)
+           VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+          [username, passwordHash, role, restricted, sectors, hostIds, alertTier],
         );
         return null;
       }
@@ -772,9 +928,9 @@ export async function saveUserAction(_state: FormState, form: FormData): Promise
 
       await client.query(
         `UPDATE users SET username = $2, role = $3, password_hash = coalesce($4, password_hash), restricted = $5,
-                          sectors = $6, host_ids = $7
+                          sectors = $6, host_ids = $7, alert_tier = $8
          WHERE id = $1`,
-        [id, username, role, passwordHash, restricted, sectors, hostIds],
+        [id, username, role, passwordHash, restricted, sectors, hostIds, alertTier],
       );
       if (passwordHash) await client.query("DELETE FROM sessions WHERE user_id = $1", [id]);
       return null;
@@ -785,6 +941,12 @@ export async function saveUserAction(_state: FormState, form: FormData): Promise
     throw error;
   }
 
+  await audit(admin, id === null ? "user.create" : "user.update", username, {
+    role,
+    restricted,
+    alertTier,
+    password: passwordHash && id !== null ? "cambiata" : undefined,
+  });
   revalidatePath("/admin/utenti");
   return { ok: true };
 }
@@ -792,14 +954,16 @@ export async function saveUserAction(_state: FormState, form: FormData): Promise
 export async function deleteUserAction(form: FormData) {
   const admin = await requireAdmin();
   const id = Number(form.get("id"));
-  if (id === admin.id) return;
+  if (id === admin.id || !isRowId(id)) return;
 
-  await transaction(async (client) => {
+  const removed = await transaction(async (client) => {
     const { rows: admins } = await client.query<{ id: number }>(
       "SELECT id FROM users WHERE role = 'admin' FOR UPDATE",
     );
-    if (admins.length === 1 && admins[0].id === id) return;
-    await client.query("DELETE FROM users WHERE id = $1", [id]);
+    if (admins.length === 1 && admins[0].id === id) return null;
+    const { rows } = await client.query<{ username: string }>("DELETE FROM users WHERE id = $1 RETURNING username", [id]);
+    return rows[0]?.username ?? null;
   });
+  if (removed) await audit(admin, "user.delete", removed);
   revalidatePath("/admin/utenti");
 }

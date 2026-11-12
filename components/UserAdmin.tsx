@@ -2,6 +2,7 @@
 
 import { useEffect, useMemo, useState } from "react";
 import { deleteUserAction, saveUserAction } from "@/lib/actions";
+import { resetUserTotpAction } from "@/lib/actions-security";
 import { fmtFullDate } from "@/lib/format";
 import { LocalTime } from "./LocalTime";
 import { groupHosts, inAccount, NO_SECTOR_LABEL, type HostGroup } from "@/lib/scope";
@@ -17,9 +18,14 @@ export interface AdminUser {
   restricted: boolean;
   sectors: string[];
   host_ids: number[];
+  alert_tier: number;
+  totp_enabled: boolean;
 }
 
 const ROLE_LABEL = { admin: "Amministratore", viewer: "Visualizzatore" };
+
+/** Chi è al livello N riceve l'avviso dopo N-1 giri di escalation senza presa in carico. */
+const TIER_LABEL: Record<number, string> = { 1: "Subito", 2: "Secondo livello", 3: "Terzo livello" };
 
 const devicesText = (count: number) => (count === 1 ? "1 dispositivo" : `${count} dispositivi`);
 
@@ -189,6 +195,15 @@ function UserForm({
           <option value="admin">Amministratore: gestisce host e utenti</option>
         </select>
       </label>
+      <label className="field">
+        <span>Avvisi</span>
+        <select className="select" name="alertTier" defaultValue={String(user?.alert_tier ?? 1)}>
+          <option value="1">Subito: primo livello</option>
+          <option value="2">Secondo livello: se nessuno prende in carico</option>
+          <option value="3">Terzo livello: se ancora nessuno risponde</option>
+        </select>
+        <small>I tempi di escalation si impostano in Impostazioni.</small>
+      </label>
       {role === "viewer" && (
         <label className="field">
           <span>Dispositivi visibili</span>
@@ -242,6 +257,7 @@ export function UserAdmin({
                 <th>Nome utente</th>
                 <th>Ruolo</th>
                 <th>Dispositivi</th>
+                <th>Avvisi</th>
                 <th>Ultimo accesso</th>
                 <th />
               </tr>
@@ -254,9 +270,15 @@ export function UserAdmin({
                       {user.username}
                       {user.id === currentUserId ? " (tu)" : ""}
                     </span>
+                    {user.totp_enabled && (
+                      <span className="cell-sub">
+                        <span className="badge badge--online">2FA</span>
+                      </span>
+                    )}
                   </td>
                   <td>{ROLE_LABEL[user.role]}</td>
                   <td className="muted">{accessLabel(user, hosts)}</td>
+                  <td className="muted nowrap">{TIER_LABEL[user.alert_tier] ?? TIER_LABEL[1]}</td>
                   <td className="muted">
                     <LocalTime seconds={user.last_login} format={fmtFullDate} />
                   </td>
@@ -264,6 +286,12 @@ export function UserAdmin({
                     <button type="button" className="btn btn--small" onClick={() => setEditing(user)}>
                       Modifica
                     </button>
+                    {user.totp_enabled && user.id !== currentUserId && (
+                      <form action={resetUserTotpAction}>
+                        <input type="hidden" name="id" value={user.id} />
+                        <ConfirmSubmit label="Azzera 2FA" confirmLabel="Confermi?" />
+                      </form>
+                    )}
                     {user.id !== currentUserId && (
                       <form action={deleteUserAction}>
                         <input type="hidden" name="id" value={user.id} />

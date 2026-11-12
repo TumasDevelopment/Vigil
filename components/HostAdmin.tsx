@@ -4,15 +4,17 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import {
   bulkUpdateHostsAction,
   deleteHostAction,
-  importHostsAction,
   saveHostAction,
   saveTypeThresholdsAction,
   toggleHostAction,
 } from "@/lib/actions";
+import { importHostsCsvAction } from "@/lib/actions-enterprise";
+import { INVENTORY_FIELDS, type InventoryKey } from "@/lib/form";
+import type { ImportPreview, ImportRow } from "@/lib/host-csv";
 import { ALL_FILTER, DEVICE_TYPES, deviceLabel, groupHosts, type DeviceType } from "@/lib/scope";
 import { DeviceIcon } from "./DeviceIcon";
 import { ConfirmSubmit, Modal, SubmitButton, useFormAction } from "./forms";
-import { IconPlus } from "./icons";
+import { IconDownload, IconPlus } from "./icons";
 import { FilterSelect } from "./Toolbar";
 
 export interface AdminHost {
@@ -26,7 +28,28 @@ export interface AdminHost {
   latency_warn_ms: number | null;
   loss_warn_pct: number | null;
   parent_id: number | null;
+  critical: boolean;
+  public_label: string | null;
+  manufacturer: string | null;
+  model: string | null;
+  serial: string | null;
+  firmware: string | null;
+  location: string | null;
+  owner: string | null;
+  inventory_note: string | null;
+  purchased_on: string | null;
+  warranty_until: string | null;
 }
+
+/** Il valore salvato di un campo dell'inventario, dal nome del campo nel modulo. */
+const inventoryValue = (host: AdminHost | null, key: InventoryKey) =>
+  host?.[key === "inventoryNote" ? "inventory_note" : key] ?? "";
+
+const INVENTORY_HINT: Partial<Record<InventoryKey, string>> = {
+  manufacturer: "Ubiquiti, HP, Siemens…",
+  location: "Armadio rack piano terra",
+  owner: "Chi se ne occupa",
+};
 
 export interface TypeThreshold {
   device_type: DeviceType;
@@ -166,6 +189,50 @@ function HostForm({
         </label>
       </div>
       <p className="form__hint">Valgono sulla media dell'ultimo minuto e hanno la precedenza sulle soglie del tipo.</p>
+      <label className="check">
+        <input type="checkbox" name="critical" defaultChecked={host?.critical ?? false} />
+        Critico: avvisa anche nelle ore di silenzio
+      </label>
+      <label className="field">
+        <span>Nome sulla pagina di stato (facoltativo)</span>
+        <input
+          className="input"
+          name="publicLabel"
+          defaultValue={host?.public_label ?? ""}
+          maxLength={80}
+          placeholder="Vuoto: non compare"
+        />
+        <small>Chi apre la pagina di stato vede solo questo nome, mai l&apos;indirizzo.</small>
+      </label>
+      <details className="form__more" open={INVENTORY_FIELDS.some((field) => inventoryValue(host, field.key)) || undefined}>
+        <summary>Inventario</summary>
+        <div className="form__grid">
+          {INVENTORY_FIELDS.filter((field) => field.key !== "inventoryNote").map((field) => (
+            <label key={field.key} className="field">
+              <span>{field.label.replace(/^(Il|La|Lo|L') ?/, "").replace(/^./, (c) => c.toUpperCase())}</span>
+              <input
+                className="input"
+                name={field.key}
+                defaultValue={inventoryValue(host, field.key)}
+                maxLength={field.max}
+                placeholder={INVENTORY_HINT[field.key]}
+              />
+            </label>
+          ))}
+          <label className="field">
+            <span>Data di acquisto</span>
+            <input className="input" type="date" name="purchasedOn" defaultValue={host?.purchased_on ?? ""} />
+          </label>
+          <label className="field">
+            <span>Fine garanzia</span>
+            <input className="input" type="date" name="warrantyUntil" defaultValue={host?.warranty_until ?? ""} />
+          </label>
+        </div>
+        <label className="field">
+          <span>Note</span>
+          <textarea className="textarea" name="inventoryNote" defaultValue={host?.inventory_note ?? ""} maxLength={500} />
+        </label>
+      </details>
       <div className="form__actions">
         <button type="button" className="btn" onClick={onDone}>
           Annulla
@@ -245,16 +312,49 @@ function ThresholdsForm({ thresholds, onDone }: { thresholds: TypeThreshold[]; o
   );
 }
 
+const ACTION_BADGE: Record<ImportRow["action"], { label: string; tone: string }> = {
+  create: { label: "Nuovo", tone: "online" },
+  update: { label: "Aggiorna", tone: "maintenance" },
+  skip: { label: "Saltato", tone: "paused" },
+  error: { label: "Errore", tone: "offline" },
+};
+
+const PREVIEW_MAX = 300;
+
+/**
+ * Import in due tempi: il primo invio legge il file e mostra cosa succederebbe riga per riga,
+ * il secondo (con confirm=1) lo applica. Se nel frattempo il modulo cambia, l'anteprima non vale più.
+ */
 function ImportForm({ onDone }: { onDone: () => void }) {
-  const { state, pending, onSubmit } = useFormAction(importHostsAction);
+  const { state, pending, submit } = useFormAction(importHostsCsvAction);
   const form = useRef<HTMLFormElement>(null);
+  const [staleAt, setStaleAt] = useState<typeof state>(undefined);
+
+  const preview = state?.data as ImportPreview | undefined;
+  const fresh = Boolean(preview) && staleAt !== state;
+  const ready = fresh && preview && !preview.applied && preview.counts.create + preview.counts.update > 0;
 
   useEffect(() => {
-    if (state?.ok) form.current?.reset();
-  }, [state]);
+    if (preview?.applied) form.current?.reset();
+  }, [preview]);
+
+  function send(confirm: boolean) {
+    if (!form.current) return;
+    const data = new FormData(form.current);
+    if (confirm) data.set("confirm", "1");
+    submit(data);
+  }
 
   return (
-    <form ref={form} onSubmit={onSubmit} className="form">
+    <form
+      ref={form}
+      onSubmit={(event) => {
+        event.preventDefault();
+        send(false);
+      }}
+      onChange={() => setStaleAt(state)}
+      className="form"
+    >
       {state?.error && (
         <div className="notice notice--error" role="alert">
           {state.error}
@@ -265,26 +365,102 @@ function ImportForm({ onDone }: { onDone: () => void }) {
           {state.message}
         </div>
       )}
+      <p className="form__hint">
+        La prima riga contiene i nomi delle colonne: <b>Indirizzo</b> è obbligatoria, le altre (Nome, Settore, Tipo,
+        Collegato a, Critico, inventario…) sono facoltative. Il modo più semplice: <a href="/api/host.csv">scarica
+        l&apos;export</a>, modificalo e reimportalo. Separatori ammessi: punto e virgola, virgola o tab.
+      </p>
       <label className="field">
-        <span>Una riga per host: nome; indirizzo; settore; tipo</span>
+        <span>File CSV</span>
+        <input className="input" type="file" name="file" accept=".csv,text/csv,text/plain" />
+      </label>
+      <label className="field">
+        <span>Oppure incolla il testo</span>
         <textarea
           className="textarea"
-          name="lines"
-          placeholder={"Gateway; 192.168.1.254; Rete; router\nStampante ufficio; 192.168.1.40; Uffici; stampante"}
-          required
+          name="csv"
+          placeholder={"Nome;Indirizzo;Settore;Tipo\nGateway;192.168.1.254;Rete;router\nStampante ufficio;192.168.1.40;Uffici;stampante"}
         />
-        <small>
-          Separatori ammessi: punto e virgola, virgola o tab. Settore e tipo sono facoltativi. Tipi: server, nas, switch,
-          router, firewall, access point, pc, stampante, telecamera, macchina, plc, altro.
-        </small>
       </label>
+      <fieldset className="field">
+        <span>Host con un indirizzo già presente</span>
+        <label className="check">
+          <input type="radio" name="mode" value="new" defaultChecked />
+          Saltali: aggiungi solo quelli nuovi
+        </label>
+        <label className="check">
+          <input type="radio" name="mode" value="update" />
+          Aggiornali con i valori del file (le colonne assenti restano come sono)
+        </label>
+      </fieldset>
+
+      {fresh && preview && (
+        <div className="import-preview">
+          <div className="import-preview__counts">
+            {(Object.keys(ACTION_BADGE) as ImportRow["action"][]).map((action) =>
+              preview.counts[action] > 0 ? (
+                <span key={action} className={`badge badge--${ACTION_BADGE[action].tone}`}>
+                  {ACTION_BADGE[action].label}: {preview.counts[action]}
+                </span>
+              ) : null,
+            )}
+            {preview.applied && <span className="muted">Importazione eseguita.</span>}
+          </div>
+          {preview.ignored.length > 0 && (
+            <p className="form__hint">
+              Colonne ignorate perché sconosciute: <b>{preview.ignored.join(", ")}</b>
+            </p>
+          )}
+          <div className="table-wrap import-preview__table">
+            <table className="table table--compact">
+              <thead>
+                <tr>
+                  <th>Riga</th>
+                  <th>Host</th>
+                  <th>Esito</th>
+                  <th>Nota</th>
+                </tr>
+              </thead>
+              <tbody>
+                {preview.rows.slice(0, PREVIEW_MAX).map((row) => (
+                  <tr key={row.line}>
+                    <td className="num">{row.line}</td>
+                    <td>
+                      <span className="cell-main">{row.name || "—"}</span>
+                      <span className="cell-sub mono">{row.address || "—"}</span>
+                    </td>
+                    <td>
+                      <span className={`badge badge--${ACTION_BADGE[row.action].tone}`}>
+                        {ACTION_BADGE[row.action].label}
+                      </span>
+                    </td>
+                    <td className="muted">{row.note}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          {preview.rows.length > PREVIEW_MAX && (
+            <p className="form__hint">Mostrate le prime {PREVIEW_MAX} righe di {preview.rows.length}.</p>
+          )}
+        </div>
+      )}
+
       <div className="form__actions">
         <button type="button" className="btn" onClick={onDone}>
           Chiudi
         </button>
-        <SubmitButton pending={pending} pendingLabel="Importazione…">
-          Importa
-        </SubmitButton>
+        {ready ? (
+          <button type="button" className="btn btn--primary" disabled={pending} onClick={() => send(true)}>
+            {pending
+              ? "Importazione…"
+              : `Importa ${preview.counts.create + preview.counts.update} host`}
+          </button>
+        ) : (
+          <SubmitButton pending={pending} pendingLabel="Lettura…">
+            Anteprima
+          </SubmitButton>
+        )}
       </div>
     </form>
   );
@@ -405,8 +581,12 @@ export function HostAdmin({ hosts, thresholds }: { hosts: AdminHost[]; threshold
             Soglie per tipo
           </button>
           <button type="button" className="btn" onClick={() => setImporting(true)}>
-            Importa elenco
+            Importa CSV
           </button>
+          <a className="btn" href="/api/host.csv">
+            <IconDownload />
+            Esporta CSV
+          </a>
           <button type="button" className="btn btn--primary" onClick={() => setEditing("new")}>
             <IconPlus />
             Nuovo host
@@ -526,7 +706,7 @@ export function HostAdmin({ hosts, thresholds }: { hosts: AdminHost[]; threshold
         </Modal>
       )}
       {importing && (
-        <Modal title="Importa elenco di host" onClose={closeImport}>
+        <Modal title="Importa host da CSV" onClose={closeImport} wide>
           <ImportForm onDone={closeImport} />
         </Modal>
       )}

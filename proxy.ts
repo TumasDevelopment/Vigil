@@ -19,11 +19,15 @@ function contentSecurityPolicy(nonce: string) {
 // Controllo rapido: c'è un cookie di sessione? Non lo verifica.
 // La verifica vera avviene in ogni pagina, API e azione con requireUser()/requireAdmin().
 // /api/avvisi si autentica con il token del PC, avvisi-windows.ps1 non contiene segreti.
+// Senza sessione: /stato e /api/salute sono pubbliche, /api/v1 si autentica con la chiave API.
+const isPublic = (pathname: string) =>
+  pathname === "/login" || pathname === "/stato" || pathname === "/api/salute" || pathname.startsWith("/api/v1/");
+
 export function proxy(request: NextRequest) {
   const { pathname } = request.nextUrl;
   const isApi = pathname.startsWith("/api/");
 
-  if (pathname !== "/login" && !request.cookies.has("vigil_sessione")) {
+  if (!isPublic(pathname) && !request.cookies.has("vigil_sessione")) {
     if (isApi) return NextResponse.json({ error: "Sessione scaduta" }, { status: 401 });
     return NextResponse.redirect(new URL("/login", request.url));
   }

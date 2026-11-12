@@ -65,7 +65,12 @@ const fullDateFormat = new Intl.DateTimeFormat(LOCALE, {
   minute: "2-digit",
 });
 
+const dateFormat = new Intl.DateTimeFormat(LOCALE, { day: "2-digit", month: "2-digit", year: "numeric" });
+
 export const fmtTime = (seconds: number) => timeFormat.format(seconds * 1000);
+export const fmtDate = (seconds: number) => dateFormat.format(seconds * 1000);
+/** "2027-03-31" → "31/03/2027", senza passare dai fusi orari. */
+export const fmtDay = (day: string) => day.split("-").reverse().join("/");
 export const fmtDateTime = (seconds: number) => dateTimeFormat.format(seconds * 1000);
 export const fmtFullDate = (seconds: number | null | undefined) =>
   seconds === null || seconds === undefined ? "—" : fullDateFormat.format(seconds * 1000);

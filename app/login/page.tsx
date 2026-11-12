@@ -1,7 +1,7 @@
 import { redirect } from "next/navigation";
 import { LoginForm } from "@/components/LoginForm";
 import { Credito, Marchio } from "@/components/Marchio";
-import { getUser } from "@/lib/auth";
+import { getUser, hasLoginChallenge } from "@/lib/auth";
 
 export const metadata = { title: "Accedi · Vigil" };
 
@@ -17,7 +17,7 @@ export default async function LoginPage() {
             <h1 className="marchio-testo">Vigil</h1>
           </div>
           <Credito />
-          <LoginForm />
+          <LoginForm codeStep={await hasLoginChallenge()} />
         </div>
       </div>
     </main>

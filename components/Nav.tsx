@@ -7,17 +7,24 @@ import type { Profile } from "@/lib/types";
 import {
   IconAccount,
   IconBookmark,
+  IconBox,
+  IconCalendar,
   IconChip,
+  IconCog,
   IconDevices,
   IconEvents,
   IconGauge,
   IconGrid,
+  IconHistory,
+  IconKey,
   IconLayers,
   IconMap,
   IconPlug,
   IconRadar,
+  IconReport,
   IconServer,
   IconSliders,
+  IconTopology,
   IconUsers,
   IconWrench,
 } from "./icons";
@@ -60,6 +67,12 @@ export function Nav({ isAdmin, profiles }: { isAdmin: boolean; profiles: Profile
       <NavLink href="/planimetrie" icon={<IconMap />}>
         Planimetrie
       </NavLink>
+      <NavLink href="/topologia" icon={<IconTopology />}>
+        Topologia
+      </NavLink>
+      <NavLink href="/inventario" icon={<IconBox />}>
+        Inventario
+      </NavLink>
       <div className="nav__section">Viste salvate</div>
       {profiles.map((profile) => (
         <NavLink key={profile.id} href={`/vista/${profile.id}`} icon={<IconBookmark />}>
@@ -81,8 +94,23 @@ export function Nav({ isAdmin, profiles }: { isAdmin: boolean; profiles: Profile
           <NavLink href="/admin/manutenzioni" icon={<IconWrench />}>
             Manutenzioni
           </NavLink>
+          <NavLink href="/admin/scadenze" icon={<IconCalendar />}>
+            Scadenze
+          </NavLink>
+          <NavLink href="/admin/report" icon={<IconReport />}>
+            Report
+          </NavLink>
           <NavLink href="/admin/utenti" icon={<IconUsers />}>
             Utenti
+          </NavLink>
+          <NavLink href="/admin/registro" icon={<IconHistory />}>
+            Registro
+          </NavLink>
+          <NavLink href="/admin/api" icon={<IconKey />}>
+            Chiavi API
+          </NavLink>
+          <NavLink href="/admin/impostazioni" icon={<IconCog />}>
+            Impostazioni
           </NavLink>
           <NavLink href="/admin/server" icon={<IconChip />}>
             Server
